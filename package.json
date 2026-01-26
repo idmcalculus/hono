@@ -260,6 +260,11 @@
       "import": "./dist/middleware/secure-headers/index.js",
       "require": "./dist/cjs/middleware/secure-headers/index.js"
     },
+    "./secure-session": {
+      "types": "./dist/types/middleware/secure-session/index.d.ts",
+      "import": "./dist/middleware/secure-session/index.js",
+      "require": "./dist/cjs/middleware/secure-session/index.js"
+    },
     "./combine": {
       "types": "./dist/types/middleware/combine/index.d.ts",
       "import": "./dist/middleware/combine/index.js",
@@ -541,6 +546,9 @@
       ],
       "secure-headers": [
         "./dist/types/middleware/secure-headers"
+      ],
+      "secure-session": [
+        "./dist/types/middleware/secure-session"
       ],
       "combine": [
         "./dist/types/middleware/combine"
