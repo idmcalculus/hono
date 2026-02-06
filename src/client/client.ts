@@ -2,7 +2,14 @@ import type { Hono } from '../hono'
 import type { FormValue, ValidationTargets } from '../types'
 import { serialize } from '../utils/cookie'
 import type { UnionToIntersection } from '../utils/types'
-import type { BuildSearchParamsFn, Callback, Client, ClientRequestOptions } from './types'
+import type {
+  BackoffStrategy,
+  BuildSearchParamsFn,
+  Callback,
+  Client,
+  ClientRequestOptions,
+  RetryOptions,
+} from './types'
 import {
   buildSearchParams,
   deepMerge,
@@ -11,6 +18,182 @@ import {
   replaceUrlParam,
   replaceUrlProtocol,
 } from './utils'
+
+const DEFAULT_RETRY_OPTIONS: Required<Omit<RetryOptions, 'shouldRetry' | 'onRetry'>> = {
+  maxRetries: 3,
+  initialDelayMs: 100,
+  maxDelayMs: 30000,
+  backoffMultiplier: 2,
+  backoff: 'exponential',
+  retryOn: [408, 429, 500, 502, 503, 504],
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const calculateBackoff = (
+  attempt: number,
+  initialDelayMs: number,
+  maxDelayMs: number,
+  backoffMultiplier: number,
+  strategy: BackoffStrategy
+): number => {
+  let delay: number
+  if (strategy === 'linear') {
+    delay = initialDelayMs * (attempt + 1)
+  } else {
+    // exponential (default)
+    delay = initialDelayMs * Math.pow(backoffMultiplier, attempt)
+  }
+  return Math.min(delay, maxDelayMs)
+}
+
+class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'TimeoutError'
+  }
+}
+
+const fetchWithTimeout = async (
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeout: number
+): Promise<Response> => {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+  // Link external AbortSignal to internal controller
+  const externalSignal = init.signal
+  let externalAbortHandler: (() => void) | undefined
+
+  if (externalSignal) {
+    // If already aborted, abort immediately
+    if (externalSignal.aborted) {
+      clearTimeout(timeoutId)
+      controller.abort()
+    } else {
+      externalAbortHandler = () => controller.abort()
+      externalSignal.addEventListener('abort', externalAbortHandler)
+    }
+  }
+
+  try {
+    const response = await fetchFn(url, {
+      ...init,
+      signal: controller.signal,
+    })
+    return response
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      // Check if the abort was from external signal or timeout
+      if (externalSignal?.aborted) {
+        throw error // Re-throw original abort error for external aborts
+      }
+      throw new TimeoutError(`Request timed out after ${timeout}ms`)
+    }
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+    if (externalSignal && externalAbortHandler) {
+      externalSignal.removeEventListener('abort', externalAbortHandler)
+    }
+  }
+}
+
+const shouldRetryResponse = async (
+  response: Response,
+  retryOptions: RetryOptions
+): Promise<boolean> => {
+  if (retryOptions.shouldRetry) {
+    return retryOptions.shouldRetry(response)
+  }
+  const retryOn = retryOptions.retryOn ?? DEFAULT_RETRY_OPTIONS.retryOn
+  return retryOn.includes(response.status)
+}
+
+const fetchWithRetry = async (
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit,
+  retryOptions: RetryOptions,
+  timeout?: number
+): Promise<Response> => {
+  const maxRetries = retryOptions.maxRetries ?? DEFAULT_RETRY_OPTIONS.maxRetries
+  const initialDelayMs = retryOptions.initialDelayMs ?? DEFAULT_RETRY_OPTIONS.initialDelayMs
+  const maxDelayMs = retryOptions.maxDelayMs ?? DEFAULT_RETRY_OPTIONS.maxDelayMs
+  const backoffMultiplier = retryOptions.backoffMultiplier ?? DEFAULT_RETRY_OPTIONS.backoffMultiplier
+  const backoffStrategy = retryOptions.backoff ?? DEFAULT_RETRY_OPTIONS.backoff
+  const onRetry = retryOptions.onRetry
+
+  let lastError: Error | undefined
+  let lastResponse: Response | undefined
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = timeout
+        ? await fetchWithTimeout(fetchFn, url, init, timeout)
+        : await fetchFn(url, init)
+
+      if (await shouldRetryResponse(response, retryOptions)) {
+        lastResponse = response
+        if (attempt < maxRetries) {
+          const delay = calculateBackoff(
+            attempt,
+            initialDelayMs,
+            maxDelayMs,
+            backoffMultiplier,
+            backoffStrategy
+          )
+          if (onRetry) {
+            await onRetry({
+              attempt: attempt + 1,
+              response,
+              delayMs: delay,
+            })
+          }
+          await sleep(delay)
+          continue
+        }
+      }
+      return response
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      // Don't retry on timeout errors or abort errors
+      if (lastError instanceof TimeoutError || lastError.name === 'AbortError') {
+        throw lastError
+      }
+      if (attempt < maxRetries) {
+        const delay = calculateBackoff(
+          attempt,
+          initialDelayMs,
+          maxDelayMs,
+          backoffMultiplier,
+          backoffStrategy
+        )
+        if (onRetry) {
+          await onRetry({
+            attempt: attempt + 1,
+            error: lastError,
+            delayMs: delay,
+          })
+        }
+        await sleep(delay)
+        continue
+      }
+    }
+  }
+
+  // If we have a response (retryable status but exhausted retries), return it
+  if (lastResponse) {
+    return lastResponse
+  }
+
+  // Otherwise throw the last error
+  throw lastError ?? new Error('Request failed')
+}
+
+export { TimeoutError }
 
 const createProxy = (callback: Callback, path: string[]) => {
   const proxy: unknown = new Proxy(() => {}, {
@@ -116,13 +299,29 @@ class ClientRequestImpl {
     methodUpperCase = this.method.toUpperCase()
     const setBody = !(methodUpperCase === 'GET' || methodUpperCase === 'HEAD')
 
-    // Pass URL string to 1st arg for testing with MSW and node-fetch
-    return (opt?.fetch || fetch)(url, {
+    const fetchFn = (opt?.fetch || fetch) as typeof fetch
+    const requestInit: RequestInit = {
       body: setBody ? this.rBody : undefined,
       method: methodUpperCase,
       headers: headers,
       ...opt?.init,
-    })
+    }
+
+    // Handle retry and timeout options
+    const retryOptions = opt?.retry
+    const timeout = opt?.timeout
+
+    // If retry is explicitly disabled or not configured, use simple fetch with optional timeout
+    if (retryOptions === false || retryOptions === undefined) {
+      if (timeout !== undefined) {
+        return fetchWithTimeout(fetchFn, url, requestInit, timeout)
+      }
+      // Pass URL string to 1st arg for testing with MSW and node-fetch
+      return fetchFn(url, requestInit)
+    }
+
+    // Use retry logic with optional timeout
+    return fetchWithRetry(fetchFn, url, requestInit, retryOptions, timeout)
   }
 }
 

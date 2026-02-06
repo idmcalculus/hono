@@ -8,6 +8,90 @@ type HonoRequest = (typeof Hono.prototype)['request']
 
 export type BuildSearchParamsFn = (query: Record<string, string | string[]>) => URLSearchParams
 
+/**
+ * Backoff strategy for retry delays.
+ * - 'exponential': delay = initialDelayMs * (backoffMultiplier ^ attempt)
+ * - 'linear': delay = initialDelayMs * (attempt + 1)
+ */
+export type BackoffStrategy = 'exponential' | 'linear'
+
+/**
+ * Context passed to the onRetry callback.
+ */
+export type RetryContext = {
+  /**
+   * The current retry attempt number (starts at 1 for the first retry).
+   */
+  attempt: number
+  /**
+   * The error that triggered the retry, if the request threw an error.
+   */
+  error?: Error
+  /**
+   * The response that triggered the retry, if the request returned a retryable status.
+   */
+  response?: globalThis.Response
+  /**
+   * The delay in milliseconds before the next retry attempt.
+   */
+  delayMs: number
+}
+
+/**
+ * Configuration options for retry behavior with exponential backoff.
+ */
+export type RetryOptions = {
+  /**
+   * Maximum number of retry attempts. Defaults to 3.
+   */
+  maxRetries?: number
+  /**
+   * Initial delay in milliseconds before the first retry. Defaults to 100.
+   */
+  initialDelayMs?: number
+  /**
+   * Maximum delay in milliseconds between retries. Defaults to 30000 (30 seconds).
+   */
+  maxDelayMs?: number
+  /**
+   * Multiplier for exponential backoff. Defaults to 2.
+   * Only used when `backoff` is 'exponential'.
+   */
+  backoffMultiplier?: number
+  /**
+   * Backoff strategy for calculating retry delays. Defaults to 'exponential'.
+   * - 'exponential': delay = initialDelayMs * (backoffMultiplier ^ attempt)
+   * - 'linear': delay = initialDelayMs * (attempt + 1)
+   */
+  backoff?: BackoffStrategy
+  /**
+   * HTTP status codes that should trigger a retry. Defaults to [408, 429, 500, 502, 503, 504].
+   */
+  retryOn?: number[]
+  /**
+   * Custom function to determine if a response should be retried.
+   * Takes precedence over `retryOn` if provided.
+   */
+  shouldRetry?: (response: globalThis.Response) => boolean | Promise<boolean>
+  /**
+   * Callback invoked before each retry attempt.
+   * Useful for logging or observing retry behavior.
+   *
+   * @example
+   * ```ts
+   * const client = hc('http://localhost', {
+   *   retry: {
+   *     maxRetries: 3,
+   *     onRetry: ({ attempt, error, response, delayMs }) => {
+   *       console.log(`Retry attempt ${attempt} after ${delayMs}ms`)
+   *     }
+   *   }
+   * })
+   * ```
+   */
+  onRetry?: (context: RetryContext) => void | Promise<void>
+}
+
 export type ClientRequestOptions<T = unknown> = {
   fetch?: typeof fetch | HonoRequest
   webSocket?: (...args: ConstructorParameters<typeof WebSocket>) => WebSocket
@@ -33,6 +117,35 @@ export type ClientRequestOptions<T = unknown> = {
    * ```
    */
   buildSearchParams?: BuildSearchParamsFn
+  /**
+   * Request timeout in milliseconds.
+   * If the request takes longer than this, it will be aborted.
+   *
+   * @example
+   * ```ts
+   * const client = hc('http://localhost', {
+   *   timeout: 5000 // 5 seconds
+   * })
+   * ```
+   */
+  timeout?: number
+  /**
+   * Retry configuration for failed requests.
+   * Set to `false` to disable retries, or provide options to customize retry behavior.
+   *
+   * @example
+   * ```ts
+   * const client = hc('http://localhost', {
+   *   retry: {
+   *     maxRetries: 3,
+   *     initialDelayMs: 100,
+   *     backoffMultiplier: 2,
+   *     retryOn: [503, 429]
+   *   }
+   * })
+   * ```
+   */
+  retry?: RetryOptions | false
 } & (keyof T extends never
   ? {
       headers?:

@@ -3,7 +3,7 @@
  * The HTTP Client for Hono.
  */
 
-export { hc } from './client'
+export { hc, TimeoutError } from './client'
 export { parseResponse, DetailedError } from './utils'
 export type {
   InferResponseType,
@@ -12,4 +12,7 @@ export type {
   ClientRequestOptions,
   ClientRequest,
   ClientResponse,
+  RetryOptions,
+  RetryContext,
+  BackoffStrategy,
 } from './types'

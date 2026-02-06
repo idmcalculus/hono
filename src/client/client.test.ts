@@ -9,7 +9,7 @@ import { Hono } from '../hono'
 import { parse } from '../utils/cookie'
 import type { Equal, Expect, JSONValue, SimplifyDeepArray } from '../utils/types'
 import { validator } from '../validator'
-import { hc } from './client'
+import { hc, TimeoutError } from './client'
 import type { ClientResponse, InferRequestType, InferResponseType } from './types'
 
 class SafeBigInt {
@@ -1599,5 +1599,638 @@ describe('Custom buildSearchParams', () => {
     const url = client.search.$url({ query: { q: 'test', tags: ['tag1', 'tag2'] } })
 
     expect(url.href).toBe('http://localhost/search?q=test&tags=tag1&tags=tag2')
+  })
+})
+
+describe('Timeout', () => {
+  const app = new Hono()
+    .get('/fast', (c) => c.json({ ok: true }))
+    .get('/slow', (c) => c.json({ ok: true }))
+
+  type AppType = typeof app
+
+  const server = setupServer(
+    http.get('http://localhost/fast', async () => {
+      return HttpResponse.json({ ok: true })
+    }),
+    http.get('http://localhost/slow', async () => {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      return HttpResponse.json({ ok: true })
+    })
+  )
+
+  beforeAll(() => server.listen())
+  afterEach(() => server.resetHandlers())
+  afterAll(() => server.close())
+
+  it('Should succeed when request completes before timeout', async () => {
+    const client = hc<AppType>('http://localhost', { timeout: 1000 })
+    const res = await client.fast.$get()
+    expect(res.ok).toBe(true)
+    const data = await res.json()
+    expect(data.ok).toBe(true)
+  })
+
+  it('Should throw TimeoutError when request exceeds timeout', async () => {
+    const client = hc<AppType>('http://localhost', { timeout: 100 })
+    await expect(client.slow.$get()).rejects.toThrow(TimeoutError)
+    await expect(client.slow.$get()).rejects.toThrow('Request timed out after 100ms')
+  })
+
+  it('Should allow per-request timeout override', async () => {
+    const client = hc<AppType>('http://localhost', { timeout: 1000 })
+    await expect(client.slow.$get(undefined, { timeout: 100 })).rejects.toThrow(TimeoutError)
+  })
+
+  it('Should work without global timeout but with per-request timeout', async () => {
+    const client = hc<AppType>('http://localhost')
+    await expect(client.slow.$get(undefined, { timeout: 100 })).rejects.toThrow(TimeoutError)
+  })
+})
+
+describe('Retry', () => {
+  const app = new Hono()
+    .get('/success', (c) => c.json({ ok: true }))
+    .get('/fail-503', (c) => c.json({ error: 'Service Unavailable' }, 503))
+    .get('/fail-once', (c) => c.json({ ok: true }))
+    .get('/fail-twice', (c) => c.json({ ok: true }))
+    .get('/fail-always', (c) => c.json({ error: 'Always fails' }, 500))
+
+  type AppType = typeof app
+
+  let failOnceCount = 0
+  let failTwiceCount = 0
+
+  const server = setupServer(
+    http.get('http://localhost/success', () => {
+      return HttpResponse.json({ ok: true })
+    }),
+    http.get('http://localhost/fail-503', () => {
+      return HttpResponse.json({ error: 'Service Unavailable' }, { status: 503 })
+    }),
+    http.get('http://localhost/fail-once', () => {
+      failOnceCount++
+      if (failOnceCount === 1) {
+        return HttpResponse.json({ error: 'Temporary error' }, { status: 503 })
+      }
+      return HttpResponse.json({ ok: true })
+    }),
+    http.get('http://localhost/fail-twice', () => {
+      failTwiceCount++
+      if (failTwiceCount <= 2) {
+        return HttpResponse.json({ error: 'Temporary error' }, { status: 503 })
+      }
+      return HttpResponse.json({ ok: true })
+    }),
+    http.get('http://localhost/fail-always', () => {
+      return HttpResponse.json({ error: 'Always fails' }, { status: 500 })
+    })
+  )
+
+  beforeAll(() => server.listen())
+  afterEach(() => {
+    failOnceCount = 0
+    failTwiceCount = 0
+    server.resetHandlers()
+  })
+  afterAll(() => server.close())
+
+  it('Should succeed without retry when request is successful', async () => {
+    const client = hc<AppType>('http://localhost', {
+      retry: { maxRetries: 3 },
+    })
+    const res = await client.success.$get()
+    expect(res.ok).toBe(true)
+  })
+
+  it('Should retry on 503 status and eventually succeed', async () => {
+    const client = hc<AppType>('http://localhost', {
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+        retryOn: [503],
+      },
+    })
+    const res = await client['fail-once'].$get()
+    expect(res.ok).toBe(true)
+    expect(failOnceCount).toBe(2) // First attempt + 1 retry
+  })
+
+  it('Should retry multiple times and succeed', async () => {
+    const client = hc<AppType>('http://localhost', {
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+        retryOn: [503],
+      },
+    })
+    const res = await client['fail-twice'].$get()
+    expect(res.ok).toBe(true)
+    expect(failTwiceCount).toBe(3) // First attempt + 2 retries
+  })
+
+  it('Should return last response when retries are exhausted', async () => {
+    const client = hc<AppType>('http://localhost', {
+      retry: {
+        maxRetries: 2,
+        initialDelayMs: 10,
+        retryOn: [500],
+      },
+    })
+    const res = await client['fail-always'].$get()
+    expect(res.ok).toBe(false)
+    expect(res.status).toBe(500)
+  })
+
+  it('Should not retry when retry is set to false', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Service Unavailable' }), { status: 503 })
+    )
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: false,
+    })
+    const res = await client['fail-503'].$get()
+    expect(res.status).toBe(503)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('Should use custom shouldRetry function', async () => {
+    let attemptCount = 0
+    const fetchMock = vi.fn().mockImplementation(() => {
+      attemptCount++
+      if (attemptCount < 3) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'Custom error' }), { status: 418 })
+        )
+      }
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+    })
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 5,
+        initialDelayMs: 10,
+        shouldRetry: (response) => response.status === 418,
+      },
+    })
+    const res = await client.success.$get()
+    expect(res.ok).toBe(true)
+    expect(attemptCount).toBe(3)
+  })
+
+  it('Should apply exponential backoff', async () => {
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, delay) => {
+      if (typeof delay === 'number' && delay > 0) {
+        delays.push(delay)
+      }
+      return originalSetTimeout(fn, 1) // Execute immediately for test speed
+    })
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 100,
+        backoffMultiplier: 2,
+        maxDelayMs: 1000,
+        retryOn: [503],
+      },
+    })
+
+    await client.success.$get()
+
+    // Check that delays follow exponential pattern: 100, 200, 400
+    expect(delays).toEqual([100, 200, 400])
+
+    vi.restoreAllMocks()
+  })
+
+  it('Should respect maxDelayMs cap', async () => {
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, delay) => {
+      if (typeof delay === 'number' && delay > 0) {
+        delays.push(delay)
+      }
+      return originalSetTimeout(fn, 1)
+    })
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 100,
+        backoffMultiplier: 10, // Would be 100, 1000, 10000 without cap
+        maxDelayMs: 500,
+        retryOn: [503],
+      },
+    })
+
+    await client.success.$get()
+
+    // All delays should be capped at 500
+    expect(delays).toEqual([100, 500, 500])
+
+    vi.restoreAllMocks()
+  })
+
+  it('Should allow per-request retry options', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', { fetch: fetchMock })
+    const res = await client.success.$get(undefined, {
+      retry: {
+        maxRetries: 1,
+        initialDelayMs: 10,
+        retryOn: [503],
+      },
+    })
+    expect(res.ok).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('Should not retry on network errors when timeout is exceeded', async () => {
+    const client = hc<AppType>('http://localhost', {
+      timeout: 50,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+      },
+    })
+
+    // Mock a slow endpoint
+    server.use(
+      http.get('http://localhost/success', async () => {
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        return HttpResponse.json({ ok: true })
+      })
+    )
+
+    await expect(client.success.$get()).rejects.toThrow(TimeoutError)
+  })
+})
+
+describe('Retry with Timeout', () => {
+  const app = new Hono().get('/intermittent', (c) => c.json({ ok: true }))
+
+  type AppType = typeof app
+
+  const server = setupServer()
+
+  beforeAll(() => server.listen())
+  afterEach(() => server.resetHandlers())
+  afterAll(() => server.close())
+
+  it('Should retry and succeed with both timeout and retry configured', async () => {
+    let attemptCount = 0
+
+    server.use(
+      http.get('http://localhost/intermittent', async () => {
+        attemptCount++
+        if (attemptCount < 3) {
+          return HttpResponse.json({ error: 'error' }, { status: 503 })
+        }
+        return HttpResponse.json({ ok: true })
+      })
+    )
+
+    const client = hc<AppType>('http://localhost', {
+      timeout: 5000,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+        retryOn: [503],
+      },
+    })
+
+    const res = await client.intermittent.$get()
+    expect(res.ok).toBe(true)
+    expect(attemptCount).toBe(3)
+  })
+})
+
+describe('onRetry callback', () => {
+  const app = new Hono()
+    .get('/fail-twice', (c) => c.json({ ok: true }))
+    .get('/network-error', (c) => c.json({ ok: true }))
+
+  type AppType = typeof app
+
+  let failCount = 0
+
+  const server = setupServer(
+    http.get('http://localhost/fail-twice', () => {
+      failCount++
+      if (failCount <= 2) {
+        return HttpResponse.json({ error: 'error' }, { status: 503 })
+      }
+      return HttpResponse.json({ ok: true })
+    })
+  )
+
+  beforeAll(() => server.listen())
+  afterEach(() => {
+    failCount = 0
+    server.resetHandlers()
+  })
+  afterAll(() => server.close())
+
+  it('Should call onRetry with correct context for retryable responses', async () => {
+    const retryCalls: Array<{ attempt: number; delayMs: number; hasResponse: boolean }> = []
+
+    const client = hc<AppType>('http://localhost', {
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+        retryOn: [503],
+        onRetry: ({ attempt, response, delayMs }) => {
+          retryCalls.push({ attempt, delayMs, hasResponse: !!response })
+        },
+      },
+    })
+
+    const res = await client['fail-twice'].$get()
+    expect(res.ok).toBe(true)
+    expect(retryCalls).toHaveLength(2)
+    expect(retryCalls[0]).toEqual({ attempt: 1, delayMs: 10, hasResponse: true })
+    expect(retryCalls[1]).toEqual({ attempt: 2, delayMs: 20, hasResponse: true })
+  })
+
+  it('Should call onRetry with error context for network errors', async () => {
+    const retryCalls: Array<{ attempt: number; hasError: boolean; errorMessage?: string }> = []
+
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error('Network failure'))
+      .mockRejectedValueOnce(new Error('Connection reset'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+        onRetry: ({ attempt, error }) => {
+          retryCalls.push({ attempt, hasError: !!error, errorMessage: error?.message })
+        },
+      },
+    })
+
+    const res = await client['network-error'].$get()
+    expect(res.ok).toBe(true)
+    expect(retryCalls).toHaveLength(2)
+    expect(retryCalls[0]).toEqual({ attempt: 1, hasError: true, errorMessage: 'Network failure' })
+    expect(retryCalls[1]).toEqual({ attempt: 2, hasError: true, errorMessage: 'Connection reset' })
+  })
+
+  it('Should support async onRetry callback', async () => {
+    const asyncOperations: number[] = []
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 2,
+        initialDelayMs: 10,
+        retryOn: [503],
+        onRetry: async ({ attempt }) => {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          asyncOperations.push(attempt)
+        },
+      },
+    })
+
+    await client['fail-twice'].$get()
+    expect(asyncOperations).toEqual([1])
+  })
+})
+
+describe('Backoff strategies', () => {
+  const app = new Hono().get('/test', (c) => c.json({ ok: true }))
+
+  type AppType = typeof app
+
+  it('Should use linear backoff when specified', async () => {
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, delay) => {
+      if (typeof delay === 'number' && delay > 0) {
+        delays.push(delay)
+      }
+      return originalSetTimeout(fn, 1)
+    })
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 100,
+        backoff: 'linear',
+        retryOn: [503],
+      },
+    })
+
+    await client.test.$get()
+
+    // Linear: 100 * (0+1), 100 * (1+1), 100 * (2+1) = 100, 200, 300
+    expect(delays).toEqual([100, 200, 300])
+
+    vi.restoreAllMocks()
+  })
+
+  it('Should use exponential backoff by default', async () => {
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, delay) => {
+      if (typeof delay === 'number' && delay > 0) {
+        delays.push(delay)
+      }
+      return originalSetTimeout(fn, 1)
+    })
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 100,
+        backoffMultiplier: 2,
+        // backoff not specified, should default to 'exponential'
+        retryOn: [503],
+      },
+    })
+
+    await client.test.$get()
+
+    // Exponential: 100 * 2^0, 100 * 2^1, 100 * 2^2 = 100, 200, 400
+    expect(delays).toEqual([100, 200, 400])
+
+    vi.restoreAllMocks()
+  })
+
+  it('Should respect maxDelayMs with linear backoff', async () => {
+    const delays: number[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, delay) => {
+      if (typeof delay === 'number' && delay > 0) {
+        delays.push(delay)
+      }
+      return originalSetTimeout(fn, 1)
+    })
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'error' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 100,
+        maxDelayMs: 150,
+        backoff: 'linear',
+        retryOn: [503],
+      },
+    })
+
+    await client.test.$get()
+
+    // Linear would be 100, 200, 300 but capped at 150
+    expect(delays).toEqual([100, 150, 150])
+
+    vi.restoreAllMocks()
+  })
+})
+
+describe('External AbortSignal with timeout', () => {
+  const app = new Hono()
+    .get('/slow', (c) => c.json({ ok: true }))
+    .get('/fast', (c) => c.json({ ok: true }))
+
+  type AppType = typeof app
+
+  const server = setupServer(
+    http.get('http://localhost/slow', async () => {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      return HttpResponse.json({ ok: true })
+    }),
+    http.get('http://localhost/fast', async () => {
+      return HttpResponse.json({ ok: true })
+    })
+  )
+
+  beforeAll(() => server.listen())
+  afterEach(() => server.resetHandlers())
+  afterAll(() => server.close())
+
+  it('Should abort request when external signal is aborted', async () => {
+    const controller = new AbortController()
+
+    const client = hc<AppType>('http://localhost', {
+      timeout: 5000, // Long timeout
+      init: {
+        signal: controller.signal,
+      },
+    })
+
+    // Abort after a short delay
+    setTimeout(() => controller.abort(), 50)
+
+    await expect(client.slow.$get()).rejects.toThrow()
+  })
+
+  it('Should propagate external abort even with timeout configured', async () => {
+    const controller = new AbortController()
+
+    const client = hc<AppType>('http://localhost', {
+      timeout: 5000,
+    })
+
+    // Abort immediately
+    controller.abort()
+
+    await expect(
+      client.slow.$get(undefined, { init: { signal: controller.signal } })
+    ).rejects.toThrow()
+  })
+
+  it('Should succeed when neither timeout nor external abort triggers', async () => {
+    const controller = new AbortController()
+
+    const client = hc<AppType>('http://localhost', {
+      timeout: 5000,
+      init: {
+        signal: controller.signal,
+      },
+    })
+
+    const res = await client.fast.$get()
+    expect(res.ok).toBe(true)
+  })
+
+  it('Should not retry on external abort', async () => {
+    const controller = new AbortController()
+    let attemptCount = 0
+
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      attemptCount++
+      // Check if signal is aborted
+      if (init?.signal?.aborted) {
+        const error = new Error('Aborted')
+        error.name = 'AbortError'
+        throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    })
+
+    const client = hc<AppType>('http://localhost', {
+      fetch: fetchMock,
+      retry: {
+        maxRetries: 3,
+        initialDelayMs: 10,
+      },
+    })
+
+    // Abort immediately
+    controller.abort()
+
+    await expect(
+      client.slow.$get(undefined, { init: { signal: controller.signal } })
+    ).rejects.toThrow()
+    expect(attemptCount).toBe(1) // Should not retry
   })
 })
