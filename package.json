@@ -220,6 +220,11 @@
       "import": "./dist/middleware/timeout/index.js",
       "require": "./dist/cjs/middleware/timeout/index.js"
     },
+    "./rate-limit": {
+      "types": "./dist/types/middleware/rate-limit/index.d.ts",
+      "import": "./dist/middleware/rate-limit/index.js",
+      "require": "./dist/cjs/middleware/rate-limit/index.js"
+    },
     "./timing": {
       "types": "./dist/types/middleware/timing/index.d.ts",
       "import": "./dist/middleware/timing/index.js",
@@ -511,6 +516,9 @@
       ],
       "timeout": [
         "./dist/types/middleware/timeout"
+      ],
+      "rate-limit": [
+        "./dist/types/middleware/rate-limit"
       ],
       "timing": [
         "./dist/types/middleware/timing"

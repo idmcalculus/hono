@@ -43,6 +43,7 @@
     "./jwt": "./src/middleware/jwt/jwt.ts",
     "./jwk": "./src/middleware/jwk/jwk.ts",
     "./timeout": "./src/middleware/timeout/index.ts",
+    "./rate-limit": "./src/middleware/rate-limit/index.ts",
     "./timing": "./src/middleware/timing/timing.ts",
     "./logger": "./src/middleware/logger/index.ts",
     "./method-override": "./src/middleware/method-override/index.ts",
