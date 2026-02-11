@@ -250,6 +250,11 @@
       "import": "./dist/middleware/request-id/index.js",
       "require": "./dist/cjs/middleware/request-id/index.js"
     },
+    "./trace-context": {
+      "types": "./dist/types/middleware/trace-context/index.d.ts",
+      "import": "./dist/middleware/trace-context/index.js",
+      "require": "./dist/cjs/middleware/trace-context/index.js"
+    },
     "./language": {
       "types": "./dist/types/middleware/language/index.d.ts",
       "import": "./dist/middleware/language/index.js",
@@ -529,6 +534,9 @@
       ],
       "request-id": [
         "./dist/types/middleware/request-id"
+      ],
+      "trace-context": [
+        "./dist/types/middleware/trace-context"
       ],
       "language": [
         "./dist/types/middleware/language"
