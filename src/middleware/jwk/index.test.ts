@@ -7,7 +7,7 @@ import { encodeBase64Url } from '../../utils/encode'
 import { Jwt } from '../../utils/jwt'
 import type { HonoJsonWebKey } from '../../utils/jwt/jws'
 import { signing } from '../../utils/jwt/jws'
-import { verifyWithJwks } from '../../utils/jwt/jwt'
+import { clearJwksCache, verifyWithJwks } from '../../utils/jwt/jwt'
 import type { JWTPayload } from '../../utils/jwt/types'
 import { utf8Encoder } from '../../utils/jwt/utf8'
 import * as test_keys from './keys.test.json'
@@ -993,5 +993,677 @@ describe('JWK', () => {
 
     // Note: Test for "no whitelist" was removed because alg is now required.
     // This is a breaking change that enforces explicit algorithm specification for security.
+  })
+
+  describe('JWKS caching', () => {
+    let fetchCount: number
+    let fetchCountB: number
+
+    beforeEach(() => {
+      fetchCount = 0
+      fetchCountB = 0
+      clearJwksCache()
+    })
+
+    // Register handlers on the shared outer `server` so there is a single MSW
+    // server instance for the entire test file.  Handlers added here are merged
+    // with the top-level ones and are reset after each test via afterEach.
+    beforeEach(() => {
+      server.use(
+        http.get('http://localhost/.well-known/cached-jwks.json', () => {
+          fetchCount++
+          return HttpResponse.json({ keys: verify_keys })
+        }),
+        http.get('http://localhost/.well-known/cached-jwks-b.json', () => {
+          fetchCountB++
+          return HttpResponse.json({ keys: verify_keys })
+        })
+      )
+    })
+
+    it('Should fetch JWKS on every request when cache is not configured', async () => {
+      const app = new Hono()
+      app.use(
+        '/no-cache/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+        })
+      )
+      app.get('/no-cache/*', (c) => c.json(c.get('jwtPayload')))
+
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      const req1 = new Request('http://localhost/no-cache/a')
+      req1.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(req1)
+
+      const req2 = new Request('http://localhost/no-cache/a')
+      req2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(req2)
+
+      expect(fetchCount).toBe(2)
+    })
+
+    it('Should reuse cached JWKS within TTL', async () => {
+      const app = new Hono()
+      app.use(
+        '/cached/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.get('/cached/*', (c) => c.json(c.get('jwtPayload')))
+
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      const req1 = new Request('http://localhost/cached/a')
+      req1.headers.set('Authorization', `Bearer ${credential}`)
+      const res1 = await app.request(req1)
+      expect(res1.status).toBe(200)
+
+      const req2 = new Request('http://localhost/cached/a')
+      req2.headers.set('Authorization', `Bearer ${credential}`)
+      const res2 = await app.request(req2)
+      expect(res2.status).toBe(200)
+
+      const req3 = new Request('http://localhost/cached/a')
+      req3.headers.set('Authorization', `Bearer ${credential}`)
+      const res3 = await app.request(req3)
+      expect(res3.status).toBe(200)
+
+      expect(fetchCount).toBe(1)
+    })
+
+    it('Should re-fetch JWKS after TTL expires', async () => {
+      const app = new Hono()
+      app.use(
+        '/short-ttl/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 0.1 },
+        })
+      )
+      app.get('/short-ttl/*', (c) => c.json(c.get('jwtPayload')))
+
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      const req1 = new Request('http://localhost/short-ttl/a')
+      req1.headers.set('Authorization', `Bearer ${credential}`)
+      const res1 = await app.request(req1)
+      expect(res1.status).toBe(200)
+      expect(fetchCount).toBe(1)
+
+      // Wait for TTL to expire (100ms + small buffer)
+      await new Promise((resolve) => setTimeout(resolve, 150))
+
+      const req2 = new Request('http://localhost/short-ttl/a')
+      req2.headers.set('Authorization', `Bearer ${credential}`)
+      const res2 = await app.request(req2)
+      expect(res2.status).toBe(200)
+      expect(fetchCount).toBe(2)
+    })
+
+    it('Should force re-fetch when kid is not found in cached keys (key rotation)', async () => {
+      // Start with only key 1 in the server response
+      let rotationFetchCount = 0
+      server.use(
+        http.get('http://localhost/.well-known/cached-jwks.json', () => {
+          rotationFetchCount++
+          // After the first fetch, include both keys (simulates key rotation)
+          const keys = rotationFetchCount === 1 ? [verify_keys[0]] : [verify_keys[0], verify_keys[1]]
+          return HttpResponse.json({ keys })
+        })
+      )
+
+      const app = new Hono()
+      app.use(
+        '/rotation/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 300 },
+        })
+      )
+      app.get('/rotation/*', (c) => c.json(c.get('jwtPayload')))
+
+      // First request with key 1 - should succeed and cache
+      const cred1 = await Jwt.sign({ message: 'key1' }, test_keys.private_keys[0])
+      const req1 = new Request('http://localhost/rotation/a')
+      req1.headers.set('Authorization', `Bearer ${cred1}`)
+      const res1 = await app.request(req1)
+      expect(res1.status).toBe(200)
+      expect(rotationFetchCount).toBe(1)
+
+      // Request with key 2 - not in cache, should force re-fetch
+      const cred2 = await Jwt.sign({ message: 'key2' }, test_keys.private_keys[1])
+      const req2 = new Request('http://localhost/rotation/a')
+      req2.headers.set('Authorization', `Bearer ${cred2}`)
+      const res2 = await app.request(req2)
+      expect(res2.status).toBe(200)
+      // Should have fetched twice: once for initial, once for rotation re-fetch
+      expect(rotationFetchCount).toBe(2)
+    })
+
+    it('Should still fail with 401 when kid is not found even after re-fetch', async () => {
+      const app = new Hono()
+      app.use(
+        '/cached-miss/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.get('/cached-miss/*', (c) => c.json(c.get('jwtPayload')))
+
+      // Sign with a key that has a kid not in the JWKS
+      const unknownKey = structuredClone(test_keys.private_keys[0])
+      unknownKey.kid = 'unknown-kid'
+      const credential = await Jwt.sign({ message: 'hello' }, unknownKey)
+
+      const req = new Request('http://localhost/cached-miss/a')
+      req.headers.set('Authorization', `Bearer ${credential}`)
+      const res = await app.request(req)
+      expect(res.status).toBe(401)
+      // Should have fetched twice: initial (or cache miss) + re-fetch attempt
+      expect(fetchCount).toBe(2)
+    })
+
+    it('Should work with both static keys and cached jwks_uri', async () => {
+      const app = new Hono()
+      app.use(
+        '/cached-combined/*',
+        jwk({
+          keys: [verify_keys[0]],
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.get('/cached-combined/*', (c) => c.json(c.get('jwtPayload')))
+
+      // Sign with key 1 (in static keys) - still fetches jwks_uri but result is cached
+      const cred1 = await Jwt.sign({ message: 'from-static' }, test_keys.private_keys[0])
+      const req1 = new Request('http://localhost/cached-combined/a')
+      req1.headers.set('Authorization', `Bearer ${cred1}`)
+      const res1 = await app.request(req1)
+      expect(res1.status).toBe(200)
+
+      // Sign with key 2 (only in remote JWKS, now cached)
+      const cred2 = await Jwt.sign({ message: 'from-remote' }, test_keys.private_keys[1])
+      const req2 = new Request('http://localhost/cached-combined/a')
+      req2.headers.set('Authorization', `Bearer ${cred2}`)
+      const res2 = await app.request(req2)
+      expect(res2.status).toBe(200)
+
+      // Only one fetch should have occurred (cached for second request)
+      expect(fetchCount).toBe(1)
+    })
+
+    it('Should pass cache option through verifyWithJwks directly', async () => {
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      await verifyWithJwks(credential, {
+        jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+        allowedAlgorithms: ['RS256'],
+        cache: { ttl: 60 },
+      })
+      await verifyWithJwks(credential, {
+        jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+        allowedAlgorithms: ['RS256'],
+        cache: { ttl: 60 },
+      })
+
+      expect(fetchCount).toBe(1)
+    })
+
+    it('Should cache two different JWKS URIs independently', async () => {
+      const app = new Hono()
+      app.use(
+        '/cached-a/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.use(
+        '/cached-b/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks-b.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.get('/cached-a/*', (c) => c.json(c.get('jwtPayload')))
+      app.get('/cached-b/*', (c) => c.json(c.get('jwtPayload')))
+
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      // Two requests to URI A – second should be cached
+      const reqA1 = new Request('http://localhost/cached-a/x')
+      reqA1.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqA1)
+
+      const reqA2 = new Request('http://localhost/cached-a/x')
+      reqA2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqA2)
+
+      expect(fetchCount).toBe(1)
+
+      // Two requests to URI B – second should be cached, independent of A
+      const reqB1 = new Request('http://localhost/cached-b/x')
+      reqB1.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqB1)
+
+      const reqB2 = new Request('http://localhost/cached-b/x')
+      reqB2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqB2)
+
+      expect(fetchCountB).toBe(1)
+
+      // A's count should still be 1 – B didn't affect it
+      expect(fetchCount).toBe(1)
+    })
+
+    it('Should clear only a single URI when clearJwksCache is given a URI', async () => {
+      const app = new Hono()
+      app.use(
+        '/clear-a/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.use(
+        '/clear-b/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks-b.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.get('/clear-a/*', (c) => c.json(c.get('jwtPayload')))
+      app.get('/clear-b/*', (c) => c.json(c.get('jwtPayload')))
+
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      // Populate both caches
+      const reqA = new Request('http://localhost/clear-a/x')
+      reqA.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqA)
+      expect(fetchCount).toBe(1)
+
+      const reqB = new Request('http://localhost/clear-b/x')
+      reqB.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqB)
+      expect(fetchCountB).toBe(1)
+
+      // Clear only URI A
+      clearJwksCache('http://localhost/.well-known/cached-jwks.json')
+
+      // A should re-fetch
+      const reqA2 = new Request('http://localhost/clear-a/x')
+      reqA2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqA2)
+      expect(fetchCount).toBe(2)
+
+      // B should still be cached
+      const reqB2 = new Request('http://localhost/clear-b/x')
+      reqB2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqB2)
+      expect(fetchCountB).toBe(1)
+    })
+
+    it('Should clear the entire cache when clearJwksCache is called without arguments', async () => {
+      const app = new Hono()
+      app.use(
+        '/clearall-a/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.use(
+        '/clearall-b/*',
+        jwk({
+          jwks_uri: 'http://localhost/.well-known/cached-jwks-b.json',
+          alg: ['RS256'],
+          cache: { ttl: 60 },
+        })
+      )
+      app.get('/clearall-a/*', (c) => c.json(c.get('jwtPayload')))
+      app.get('/clearall-b/*', (c) => c.json(c.get('jwtPayload')))
+
+      const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+      // Populate both caches
+      const reqA = new Request('http://localhost/clearall-a/x')
+      reqA.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqA)
+
+      const reqB = new Request('http://localhost/clearall-b/x')
+      reqB.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqB)
+
+      expect(fetchCount).toBe(1)
+      expect(fetchCountB).toBe(1)
+
+      // Clear everything
+      clearJwksCache()
+
+      // Both should re-fetch
+      const reqA2 = new Request('http://localhost/clearall-a/x')
+      reqA2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqA2)
+
+      const reqB2 = new Request('http://localhost/clearall-b/x')
+      reqB2.headers.set('Authorization', `Bearer ${credential}`)
+      await app.request(reqB2)
+
+      expect(fetchCount).toBe(2)
+      expect(fetchCountB).toBe(2)
+    })
+
+    describe('backgroundRefresh', () => {
+      it('Should trigger a background refresh on cache hit and update the cache', async () => {
+        let bgFetchCount = 0
+        server.use(
+          http.get('http://localhost/.well-known/cached-jwks.json', () => {
+            bgFetchCount++
+            return HttpResponse.json({ keys: verify_keys })
+          })
+        )
+
+        const app = new Hono()
+        app.use(
+          '/bg/*',
+          jwk({
+            jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+            alg: ['RS256'],
+            cache: { ttl: 60, backgroundRefresh: true },
+          })
+        )
+        app.get('/bg/*', (c) => c.json(c.get('jwtPayload')))
+
+        const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+        // First request – cold cache, foreground fetch
+        const req1 = new Request('http://localhost/bg/a')
+        req1.headers.set('Authorization', `Bearer ${credential}`)
+        const res1 = await app.request(req1)
+        expect(res1.status).toBe(200)
+        expect(bgFetchCount).toBe(1)
+
+        // Second request – cache hit, triggers background refresh
+        const req2 = new Request('http://localhost/bg/a')
+        req2.headers.set('Authorization', `Bearer ${credential}`)
+        const res2 = await app.request(req2)
+        expect(res2.status).toBe(200)
+
+        // Allow the background refresh microtask to settle
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(bgFetchCount).toBe(2)
+      })
+
+      it('Should not trigger a background refresh when backgroundRefresh is false', async () => {
+        let bgFetchCount = 0
+        server.use(
+          http.get('http://localhost/.well-known/cached-jwks.json', () => {
+            bgFetchCount++
+            return HttpResponse.json({ keys: verify_keys })
+          })
+        )
+
+        const app = new Hono()
+        app.use(
+          '/no-bg/*',
+          jwk({
+            jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+            alg: ['RS256'],
+            cache: { ttl: 60, backgroundRefresh: false },
+          })
+        )
+        app.get('/no-bg/*', (c) => c.json(c.get('jwtPayload')))
+
+        const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+        const req1 = new Request('http://localhost/no-bg/a')
+        req1.headers.set('Authorization', `Bearer ${credential}`)
+        await app.request(req1)
+
+        const req2 = new Request('http://localhost/no-bg/a')
+        req2.headers.set('Authorization', `Bearer ${credential}`)
+        await app.request(req2)
+
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(bgFetchCount).toBe(1)
+      })
+
+      it('Should prevent concurrent background refreshes for the same URI', async () => {
+        let bgFetchCount = 0
+        // Gate that the test controls: the background fetch blocks until the
+        // test resolves this promise, giving us a deterministic way to hold the
+        // in-flight guard open while more requests arrive.
+        let unblockFetch: () => void
+        let fetchBlocked: Promise<void>
+        const resetGate = () => {
+          fetchBlocked = new Promise<void>((resolve) => {
+            unblockFetch = resolve
+          })
+        }
+        resetGate()
+
+        // Track each time the handler is *entered* so we can assert even
+        // before the response is sent.
+        let handlerEnteredResolve: () => void
+        let handlerEntered: Promise<void> = new Promise((r) => { handlerEnteredResolve = r })
+
+        server.use(
+          http.get('http://localhost/.well-known/cached-jwks.json', async () => {
+            bgFetchCount++
+            handlerEnteredResolve()
+            // Block until the test explicitly unblocks – no wall-clock timer
+            await fetchBlocked
+            return HttpResponse.json({ keys: verify_keys })
+          })
+        )
+
+        const app = new Hono()
+        app.use(
+          '/bg-dedup/*',
+          jwk({
+            jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+            alg: ['RS256'],
+            cache: { ttl: 60, backgroundRefresh: true },
+          })
+        )
+        app.get('/bg-dedup/*', (c) => c.json(c.get('jwtPayload')))
+
+        const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+        // First request – foreground fetch (blocks until we unblock the gate)
+        const foreground = app.request(
+          new Request('http://localhost/bg-dedup/a', {
+            headers: { Authorization: `Bearer ${credential}` },
+          })
+        )
+        await handlerEntered
+        expect(bgFetchCount).toBe(1)
+        unblockFetch!()
+        await foreground
+
+        // Reset the gate so the background refresh will block
+        resetGate()
+        handlerEntered = new Promise((r) => { handlerEnteredResolve = r })
+
+        // Fire five concurrent cache-hit requests.  All five should return
+        // immediately from cache, and at most one background refresh should
+        // be started.
+        const concurrent = Array.from({ length: 5 }, (_, i) =>
+          app.request(
+            new Request(`http://localhost/bg-dedup/${i}`, {
+              headers: { Authorization: `Bearer ${credential}` },
+            })
+          )
+        )
+        const responses = await Promise.all(concurrent)
+        for (const res of responses) {
+          expect(res.status).toBe(200)
+        }
+
+        // Wait for the single background handler to be entered, then unblock it
+        await handlerEntered
+        unblockFetch!()
+        // Yield to let the .finally() clean-up run
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        // 1 foreground + exactly 1 background, despite 5 concurrent cache hits
+        expect(bgFetchCount).toBe(2)
+      })
+
+      it('Should call onRefreshError when a background refresh fails', async () => {
+        let bgFetchCount = 0
+        server.use(
+          http.get('http://localhost/.well-known/cached-jwks.json', () => {
+            bgFetchCount++
+            // First call succeeds (foreground), second call fails (background)
+            if (bgFetchCount === 1) {
+              return HttpResponse.json({ keys: verify_keys })
+            }
+            return HttpResponse.text('Internal Server Error', { status: 500 })
+          })
+        )
+
+        const errors: Error[] = []
+        const app = new Hono()
+        app.use(
+          '/bg-err/*',
+          jwk({
+            jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+            alg: ['RS256'],
+            cache: {
+              ttl: 60,
+              backgroundRefresh: true,
+              onRefreshError: (err) => errors.push(err),
+            },
+          })
+        )
+        app.get('/bg-err/*', (c) => c.json(c.get('jwtPayload')))
+
+        const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+        // First request – foreground fetch succeeds
+        const req1 = new Request('http://localhost/bg-err/a')
+        req1.headers.set('Authorization', `Bearer ${credential}`)
+        const res1 = await app.request(req1)
+        expect(res1.status).toBe(200)
+
+        // Second request – cache hit, background refresh will fail
+        const req2 = new Request('http://localhost/bg-err/a')
+        req2.headers.set('Authorization', `Bearer ${credential}`)
+        const res2 = await app.request(req2)
+        // The current request still succeeds from cache
+        expect(res2.status).toBe(200)
+
+        // Wait for the background refresh to settle
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(errors).toHaveLength(1)
+        expect(errors[0]).toBeInstanceOf(Error)
+        expect(errors[0].message).toContain('failed to fetch JWKS')
+      })
+
+      it('Should not break the current request when background refresh fails and no onRefreshError is provided', async () => {
+        let bgFetchCount = 0
+        server.use(
+          http.get('http://localhost/.well-known/cached-jwks.json', () => {
+            bgFetchCount++
+            if (bgFetchCount === 1) {
+              return HttpResponse.json({ keys: verify_keys })
+            }
+            return HttpResponse.text('Internal Server Error', { status: 500 })
+          })
+        )
+
+        const app = new Hono()
+        app.use(
+          '/bg-silent/*',
+          jwk({
+            jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+            alg: ['RS256'],
+            cache: { ttl: 60, backgroundRefresh: true },
+          })
+        )
+        app.get('/bg-silent/*', (c) => c.json(c.get('jwtPayload')))
+
+        const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+        // First request – foreground
+        const req1 = new Request('http://localhost/bg-silent/a')
+        req1.headers.set('Authorization', `Bearer ${credential}`)
+        const res1 = await app.request(req1)
+        expect(res1.status).toBe(200)
+
+        // Second request – triggers failing background refresh with no callback
+        const req2 = new Request('http://localhost/bg-silent/a')
+        req2.headers.set('Authorization', `Bearer ${credential}`)
+        const res2 = await app.request(req2)
+        expect(res2.status).toBe(200)
+
+        // Let background settle – no unhandled rejection should occur
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(bgFetchCount).toBe(2)
+      })
+
+      it('Should allow background refresh in-flight guard to reset after completion', async () => {
+        let bgFetchCount = 0
+        server.use(
+          http.get('http://localhost/.well-known/cached-jwks.json', () => {
+            bgFetchCount++
+            return HttpResponse.json({ keys: verify_keys })
+          })
+        )
+
+        const app = new Hono()
+        app.use(
+          '/bg-reset/*',
+          jwk({
+            jwks_uri: 'http://localhost/.well-known/cached-jwks.json',
+            alg: ['RS256'],
+            cache: { ttl: 60, backgroundRefresh: true },
+          })
+        )
+        app.get('/bg-reset/*', (c) => c.json(c.get('jwtPayload')))
+
+        const credential = await Jwt.sign({ message: 'hello' }, test_keys.private_keys[0])
+
+        // First request – foreground
+        const req1 = new Request('http://localhost/bg-reset/a')
+        req1.headers.set('Authorization', `Bearer ${credential}`)
+        await app.request(req1)
+        expect(bgFetchCount).toBe(1)
+
+        // Second request – cache hit, starts background refresh
+        const req2 = new Request('http://localhost/bg-reset/a')
+        req2.headers.set('Authorization', `Bearer ${credential}`)
+        await app.request(req2)
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(bgFetchCount).toBe(2)
+
+        // Third request – in-flight guard should have been released, so a new
+        // background refresh can start
+        const req3 = new Request('http://localhost/bg-reset/a')
+        req3.headers.set('Authorization', `Bearer ${credential}`)
+        await app.request(req3)
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(bgFetchCount).toBe(3)
+      })
+    })
   })
 })

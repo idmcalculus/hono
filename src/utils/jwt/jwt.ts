@@ -188,6 +188,121 @@ const symmetricAlgorithms: SymmetricAlgorithm[] = [
   AlgorithmTypes.HS512,
 ]
 
+/**
+ * JWKS cache entry
+ */
+interface JwksCacheEntry {
+  keys: HonoJsonWebKey[]
+  expiry: number
+}
+
+/**
+ * In-memory JWKS cache keyed by URI
+ */
+const jwksCache = new Map<string, JwksCacheEntry>()
+
+/**
+ * Tracks in-flight background refresh promises per URI to prevent concurrent refreshes.
+ */
+const backgroundRefreshInFlight = new Set<string>()
+
+interface FetchJwksOptions {
+  uri: string
+  init?: RequestInit
+  cacheTtl?: number
+  backgroundRefresh?: boolean
+  onRefreshError?: (err: Error) => void
+}
+
+/**
+ * Performs the actual JWKS fetch and cache-store. Shared by foreground and
+ * background paths so that validation and caching logic is not duplicated.
+ */
+const doFetchJwks = async (opts: FetchJwksOptions): Promise<HonoJsonWebKey[]> => {
+  const response = await fetch(opts.uri, opts.init)
+  if (!response.ok) {
+    throw new Error(`failed to fetch JWKS from ${opts.uri}`)
+  }
+  const data = (await response.json()) as { keys?: JsonWebKey[] }
+  if (!data.keys) {
+    throw new Error('invalid JWKS response. "keys" field is missing')
+  }
+  if (!Array.isArray(data.keys)) {
+    throw new Error('invalid JWKS response. "keys" field is not an array')
+  }
+
+  const keys = data.keys as HonoJsonWebKey[]
+  if (opts.cacheTtl && opts.cacheTtl > 0) {
+    jwksCache.set(opts.uri, { keys, expiry: Date.now() + opts.cacheTtl * 1000 })
+  }
+
+  return keys
+}
+
+/**
+ * Fetches JWKS from a URI, using a cache when configured.
+ *
+ * When `backgroundRefresh` is true and there is a cache hit, a non-blocking
+ * refresh is kicked off so that subsequent requests benefit from fresh keys.
+ * Concurrent background refreshes for the same URI are prevented by an
+ * in-flight guard. Background failures are reported via `onRefreshError`
+ * but never break the current request.
+ */
+const fetchJwks = async (opts: FetchJwksOptions): Promise<HonoJsonWebKey[]> => {
+  if (opts.cacheTtl && opts.cacheTtl > 0) {
+    const cached = jwksCache.get(opts.uri)
+    if (cached && cached.expiry > Date.now()) {
+      if (opts.backgroundRefresh && !backgroundRefreshInFlight.has(opts.uri)) {
+        backgroundRefreshInFlight.add(opts.uri)
+        doFetchJwks(opts)
+          .catch((err) => {
+            if (opts.onRefreshError) {
+              opts.onRefreshError(err instanceof Error ? err : new Error(String(err)))
+            }
+          })
+          .finally(() => {
+            backgroundRefreshInFlight.delete(opts.uri)
+          })
+      }
+      return cached.keys
+    }
+  }
+
+  return doFetchJwks(opts)
+}
+
+/**
+ * Clears the internal JWKS cache.
+ *
+ * @param uri - When provided, only the cache entry for that specific JWKS URI
+ *   is removed. When omitted, the entire cache is cleared.
+ */
+export const clearJwksCache = (uri?: string): void => {
+  if (uri) {
+    jwksCache.delete(uri)
+  } else {
+    jwksCache.clear()
+  }
+}
+
+export type JwksCacheOptions = {
+  /** Cache TTL in seconds. Cached JWKS responses are reused until the TTL expires. */
+  ttl: number
+  /**
+   * When `true`, a cache hit triggers a non-blocking background refresh so that
+   * subsequent requests benefit from fresh keys without incurring fetch latency.
+   * Concurrent background refreshes for the same URI are prevented automatically.
+   * Background refresh failures are reported via `onRefreshError` but never break
+   * the current request.
+   */
+  backgroundRefresh?: boolean
+  /**
+   * Called when a background refresh fails. If not provided, background refresh
+   * errors are silently ignored. This callback should not throw.
+   */
+  onRefreshError?: (err: Error) => void
+}
+
 export const verifyWithJwks = async (
   token: string,
   options: {
@@ -195,6 +310,7 @@ export const verifyWithJwks = async (
     jwks_uri?: string
     verification?: VerifyOptions
     allowedAlgorithms: readonly AsymmetricAlgorithm[]
+    cache?: JwksCacheOptions
   },
   init?: RequestInit
 ): Promise<JWTPayload> => {
@@ -219,28 +335,39 @@ export const verifyWithJwks = async (
     throw new JwtAlgorithmNotAllowed(header.alg, options.allowedAlgorithms)
   }
 
+  let allKeys: HonoJsonWebKey[] = []
+
+  if (options.keys) {
+    allKeys = [...options.keys]
+  }
+
   if (options.jwks_uri) {
-    const response = await fetch(options.jwks_uri, init)
-    if (!response.ok) {
-      throw new Error(`failed to fetch JWKS from ${options.jwks_uri}`)
-    }
-    const data = (await response.json()) as { keys?: JsonWebKey[] }
-    if (!data.keys) {
-      throw new Error('invalid JWKS response. "keys" field is missing')
-    }
-    if (!Array.isArray(data.keys)) {
-      throw new Error('invalid JWKS response. "keys" field is not an array')
-    }
-    if (options.keys) {
-      options.keys.push(...data.keys)
-    } else {
-      options.keys = data.keys
-    }
+    const remoteKeys = await fetchJwks({
+      uri: options.jwks_uri,
+      init,
+      cacheTtl: options.cache?.ttl,
+      backgroundRefresh: options.cache?.backgroundRefresh,
+      onRefreshError: options.cache?.onRefreshError,
+    })
+    allKeys.push(...remoteKeys)
   } else if (!options.keys) {
     throw new Error('verifyWithJwks requires options for either "keys" or "jwks_uri" or both')
   }
 
-  const matchingKey = options.keys.find((key) => key.kid === header.kid)
+  let matchingKey = allKeys.find((key) => key.kid === header.kid)
+
+  // If kid not found and cache is enabled, force a re-fetch to handle key rotation
+  if (!matchingKey && options.jwks_uri && options.cache?.ttl) {
+    jwksCache.delete(options.jwks_uri)
+    const refreshedKeys = await fetchJwks({
+      uri: options.jwks_uri,
+      init,
+      cacheTtl: options.cache.ttl,
+    })
+    const combined = options.keys ? [...options.keys, ...refreshedKeys] : refreshedKeys
+    matchingKey = combined.find((key) => key.kid === header.kid)
+  }
+
   if (!matchingKey) {
     throw new JwtTokenInvalid(token)
   }
