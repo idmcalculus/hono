@@ -657,6 +657,79 @@ describe('DOM', () => {
       expect(root.innerHTML).toBe('<div><span>1</span><span>2</span></div>')
     })
 
+    it('empty array and non-empty array', async () => {
+      const App = () => (
+        <div>
+          {[]}
+          {[<span>1</span>]}
+        </div>
+      )
+      render(<App />, root)
+      expect(root.innerHTML).toBe('<div><span>1</span></div>')
+    })
+
+    it('nested array', async () => {
+      const nestedChildren: Child = [[[<span>1</span>], <span>2</span>]]
+      const App = () => <div>{nestedChildren}</div>
+      render(<App />, root)
+      expect(root.innerHTML).toBe('<div><span>1</span><span>2</span></div>')
+    })
+
+    it('sparse array with nested child', async () => {
+      const sparseChildren: Child[] = []
+      sparseChildren[1] = [<span>1</span>]
+      const App = () => <div>{sparseChildren}</div>
+      render(<App />, root)
+      expect(root.innerHTML).toBe('<div><span>1</span></div>')
+    })
+
+    it('toggle empty array and non-empty array on update', async () => {
+      let setVisible: (value: boolean) => void = () => {}
+      const App = () => {
+        const [visible, _setVisible] = useState(false)
+        setVisible = _setVisible
+        return (
+          <div>
+            {visible ? [] : [<span key='a'>A</span>]}
+            {visible ? [<span key='b'>B</span>] : []}
+          </div>
+        )
+      }
+      render(<App />, root)
+      expect(root.innerHTML).toBe('<div><span>A</span></div>')
+
+      setVisible(true)
+      await Promise.resolve()
+      expect(root.innerHTML).toBe('<div><span>B</span></div>')
+
+      setVisible(false)
+      await Promise.resolve()
+      expect(root.innerHTML).toBe('<div><span>A</span></div>')
+    })
+
+    it('reshape nested array on update', async () => {
+      let setPattern: (value: number) => void = () => {}
+      const App = () => {
+        const [pattern, _setPattern] = useState(0)
+        setPattern = _setPattern
+        const children: Child =
+          pattern === 0
+            ? [[<span key='a'>A</span>], <span key='b'>B</span>]
+            : [<span key='a'>A</span>, [<span key='b'>B</span>]]
+        return <div>{children}</div>
+      }
+      render(<App />, root)
+      expect(root.innerHTML).toBe('<div><span>A</span><span>B</span></div>')
+
+      setPattern(1)
+      await Promise.resolve()
+      expect(root.innerHTML).toBe('<div><span>A</span><span>B</span></div>')
+
+      setPattern(0)
+      await Promise.resolve()
+      expect(root.innerHTML).toBe('<div><span>A</span><span>B</span></div>')
+    })
+
     it('use the same children multiple times', async () => {
       const MultiChildren = ({ children }: { children: Child }) => (
         <>
