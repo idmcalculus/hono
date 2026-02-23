@@ -268,4 +268,214 @@ describe('Serve Static Middleware', () => {
       expect(await res.text()).toBe('Hello in etc/passwd')
     })
   })
+
+  describe('Range requests', () => {
+    const rangeContent = '0123456789ABCDEFGHIJ' // 20 bytes
+    const rangeApp = new Hono()
+    rangeApp.use(
+      '*',
+      baseServeStatic({
+        getContent: async (path) => {
+          if (path.endsWith('not-found.txt')) {
+            return null
+          }
+          return rangeContent
+        },
+      })
+    )
+
+    it('Should include Accept-Ranges header in response', async () => {
+      const res = await rangeApp.request('/static/file.txt')
+      expect(res.status).toBe(200)
+      expect(res.headers.get('Accept-Ranges')).toBe('bytes')
+    })
+
+    it('Should return 206 for valid range bytes=0-9', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=0-9' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 0-9/20')
+      expect(res.headers.get('Content-Length')).toBe('10')
+      expect(res.headers.get('Accept-Ranges')).toBe('bytes')
+      expect(await res.text()).toBe('0123456789')
+    })
+
+    it('Should return 206 for valid range bytes=10-19', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=10-19' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 10-19/20')
+      expect(res.headers.get('Content-Length')).toBe('10')
+      expect(await res.text()).toBe('ABCDEFGHIJ')
+    })
+
+    it('Should return 206 for open-ended range bytes=15-', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=15-' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 15-19/20')
+      expect(res.headers.get('Content-Length')).toBe('5')
+      expect(await res.text()).toBe('FGHIJ')
+    })
+
+    it('Should return 206 for suffix range bytes=-5', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=-5' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 15-19/20')
+      expect(res.headers.get('Content-Length')).toBe('5')
+      expect(await res.text()).toBe('FGHIJ')
+    })
+
+    it('Should return 206 for single byte range bytes=5-5', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=5-5' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 5-5/20')
+      expect(res.headers.get('Content-Length')).toBe('1')
+      expect(await res.text()).toBe('5')
+    })
+
+    it('Should clamp end to file size for range bytes=0-100', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=0-100' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 0-19/20')
+      expect(res.headers.get('Content-Length')).toBe('20')
+      expect(await res.text()).toBe('0123456789ABCDEFGHIJ')
+    })
+
+    it('Should return 416 for unsatisfiable range bytes=20-30', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=20-30' },
+      })
+      expect(res.status).toBe(416)
+      expect(res.headers.get('Content-Range')).toBe('bytes */20')
+    })
+
+    it('Should return 416 for unsatisfiable range bytes=100-200', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=100-200' },
+      })
+      expect(res.status).toBe(416)
+      expect(res.headers.get('Content-Range')).toBe('bytes */20')
+    })
+
+    it('Should return 416 for invalid range bytes=10-5 (start > end)', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=10-5' },
+      })
+      expect(res.status).toBe(416)
+      expect(res.headers.get('Content-Range')).toBe('bytes */20')
+    })
+
+    it('Should return 200 for invalid range header format (ignored per RFC 7233)', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'invalid-range' },
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('Content-Range')).toBeNull()
+      expect(await res.text()).toBe('0123456789ABCDEFGHIJ')
+    })
+
+    it('Should return 200 for multi-range (ignored per RFC 7233)', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=0-5, 10-15' },
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('Content-Range')).toBeNull()
+      expect(await res.text()).toBe('0123456789ABCDEFGHIJ')
+    })
+
+    it('Should return 200 for non-bytes range unit (ignored per RFC 7233)', async () => {
+      const res = await rangeApp.request('/static/file.txt', {
+        headers: { Range: 'items=0-5' },
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('Content-Range')).toBeNull()
+      expect(await res.text()).toBe('0123456789ABCDEFGHIJ')
+    })
+
+    it('Should work with ArrayBuffer content', async () => {
+      const bufferApp = new Hono()
+      const encoder = new TextEncoder()
+      bufferApp.use(
+        '*',
+        baseServeStatic({
+          getContent: async () => encoder.encode(rangeContent).buffer as ArrayBuffer,
+        })
+      )
+
+      const res = await bufferApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=0-9' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 0-9/20')
+      expect(await res.text()).toBe('0123456789')
+    })
+
+    it('Should work with Uint8Array content', async () => {
+      const uint8App = new Hono()
+      const encoder = new TextEncoder()
+      uint8App.use(
+        '*',
+        baseServeStatic({
+          getContent: async () => encoder.encode(rangeContent),
+        })
+      )
+
+      const res = await uint8App.request('/static/file.txt', {
+        headers: { Range: 'bytes=0-9' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 0-9/20')
+      expect(await res.text()).toBe('0123456789')
+    })
+
+    it('Should work with ReadableStream content (multiple chunks)', async () => {
+      const streamApp = new Hono()
+      const encoder = new TextEncoder()
+      // Split content into multiple chunks to test reassembly
+      const chunks = ['01234', '56789', 'ABCDE', 'FGHIJ']
+      streamApp.use(
+        '*',
+        baseServeStatic({
+          getContent: async () => {
+            let chunkIndex = 0
+            return new ReadableStream({
+              pull(controller) {
+                if (chunkIndex < chunks.length) {
+                  controller.enqueue(encoder.encode(chunks[chunkIndex]))
+                  chunkIndex++
+                } else {
+                  controller.close()
+                }
+              },
+            })
+          },
+        })
+      )
+
+      const res = await streamApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=0-9' },
+      })
+      expect(res.status).toBe(206)
+      expect(res.headers.get('Content-Range')).toBe('bytes 0-9/20')
+      expect(await res.text()).toBe('0123456789')
+
+      // Also test a range that spans multiple chunks
+      const res2 = await streamApp.request('/static/file.txt', {
+        headers: { Range: 'bytes=3-12' },
+      })
+      expect(res2.status).toBe(206)
+      expect(res2.headers.get('Content-Range')).toBe('bytes 3-12/20')
+      expect(await res2.text()).toBe('3456789ABC')
+    })
+  })
 })

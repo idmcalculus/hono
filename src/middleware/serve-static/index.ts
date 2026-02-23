@@ -7,6 +7,7 @@ import type { Context, Data } from '../../context'
 import type { Env, MiddlewareHandler } from '../../types'
 import { COMPRESSIBLE_CONTENT_TYPE_REGEX } from '../../utils/compress'
 import { getMimeType } from '../../utils/mime'
+import { contentRange, parseRange } from '../../utils/range'
 import { defaultJoin } from './path'
 
 export type ServeStaticOptions<E extends Env = Env> = {
@@ -27,6 +28,42 @@ const ENCODINGS = {
 const ENCODINGS_ORDERED_KEYS = Object.keys(ENCODINGS) as (keyof typeof ENCODINGS)[]
 
 const DEFAULT_DOCUMENT = 'index.html'
+
+/**
+ * Converts Data to Uint8Array for range request handling.
+ */
+const toBytes = async (data: Data): Promise<Uint8Array> => {
+  if (data instanceof Uint8Array) {
+    return data
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data)
+  }
+  if (typeof data === 'string') {
+    return new TextEncoder().encode(data)
+  }
+  // ReadableStream
+  const reader = data.getReader()
+  const chunks: Uint8Array[] = []
+  let totalLength = 0
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) {
+      break
+    }
+    chunks.push(value)
+    totalLength += value.byteLength
+  }
+
+  const result = new Uint8Array(totalLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    result.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return result
+}
 
 /**
  * This middleware is not directly used by the user. Create a wrapper specifying `getContent()` by the environment such as Deno or Bun.
@@ -115,6 +152,36 @@ export const serveStatic = <E extends Env = Env>(
         }
       }
       await options.onFound?.(path, c)
+
+      // Always indicate range request support
+      c.header('Accept-Ranges', 'bytes')
+
+      // Handle Range request
+      const rangeHeader = c.req.header('Range')
+      if (rangeHeader) {
+        const bytes = await toBytes(content)
+        const totalSize = bytes.byteLength
+        const range = parseRange(rangeHeader, totalSize)
+
+        if (range === null) {
+          // Unsatisfiable range
+          c.header('Content-Range', `bytes */${totalSize}`)
+          c.status(416)
+          return c.body(null)
+        }
+
+        if (range !== undefined) {
+          // Valid range - return partial content
+          const { start, end } = range
+          const slicedContent = bytes.subarray(start, end + 1)
+          c.header('Content-Range', contentRange(start, end, totalSize))
+          c.header('Content-Length', String(slicedContent.byteLength))
+          c.status(206)
+          return c.body(slicedContent)
+        }
+        // undefined: non-bytes or multi-range, ignore and serve full content
+      }
+
       return c.body(content)
     }
 
