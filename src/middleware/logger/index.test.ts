@@ -126,6 +126,276 @@ describe('Logger by Middleware', () => {
   })
 })
 
+describe('Logger by Middleware in JSON mode', () => {
+  const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z$/
+  let app: Hono
+  let logs: string[]
+
+  beforeEach(() => {
+    function sleep(time: number) {
+      return new Promise((resolve) => setTimeout(resolve, time))
+    }
+
+    app = new Hono()
+    logs = []
+
+    const logFn = (str: string) => {
+      logs.push(str)
+    }
+
+    app.use('*', logger(logFn, { mode: 'json' }))
+    app.get('/hello', (c) => c.text('Hello'))
+    app.get('/redirect', (c) => c.redirect('/hello', 301))
+    app.get('/not-found', (c) => c.text('Not Found', 404))
+    app.get('/error', (c) => c.text('Server Error', 500))
+    app.get('/seconds', async (c) => {
+      await sleep(1000)
+      return c.text('slow')
+    })
+  })
+
+  it('emits valid JSON for incoming and outgoing with timestamp', async () => {
+    const res = await app.request('http://localhost/hello')
+    expect(res.status).toBe(200)
+    expect(logs).toHaveLength(2)
+
+    const incoming = JSON.parse(logs[0])
+    expect(incoming.timestamp).toMatch(ISO_8601_RE)
+    expect(incoming.direction).toBe('incoming')
+    expect(incoming.method).toBe('GET')
+    expect(incoming.path).toBe('/hello')
+    expect(incoming.level).toBe('info')
+    expect(incoming.status).toBeUndefined()
+    expect(incoming.elapsed).toBeUndefined()
+
+    const outgoing = JSON.parse(logs[1])
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+    expect(outgoing.direction).toBe('outgoing')
+    expect(outgoing.method).toBe('GET')
+    expect(outgoing.path).toBe('/hello')
+    expect(outgoing.level).toBe('info')
+    expect(outgoing.status).toBe(200)
+    expect(outgoing.elapsed).toMatch(/m?s$/)
+  })
+
+  it('includes query params in path', async () => {
+    const res = await app.request('http://localhost/hello?foo=bar')
+    expect(res.status).toBe(200)
+
+    const incoming = JSON.parse(logs[0])
+    expect(incoming.path).toBe('/hello?foo=bar')
+
+    const outgoing = JSON.parse(logs[1])
+    expect(outgoing.path).toBe('/hello?foo=bar')
+  })
+
+  it('records correct status and level for 301 redirect', async () => {
+    const res = await app.request('http://localhost/redirect')
+    expect(res.status).toBe(301)
+
+    const outgoing = JSON.parse(logs[1])
+    expect(outgoing.status).toBe(301)
+    expect(outgoing.level).toBe('info')
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+  })
+
+  it('records correct status and warn level for 404', async () => {
+    const res = await app.request('http://localhost/not-found')
+    expect(res.status).toBe(404)
+
+    const outgoing = JSON.parse(logs[1])
+    expect(outgoing.status).toBe(404)
+    expect(outgoing.level).toBe('warn')
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+  })
+
+  it('records correct status and error level for 500', async () => {
+    const res = await app.request('http://localhost/error')
+    expect(res.status).toBe(500)
+
+    const outgoing = JSON.parse(logs[1])
+    expect(outgoing.status).toBe(500)
+    expect(outgoing.level).toBe('error')
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+  })
+
+  it('elapsed time in seconds for slow responses', async () => {
+    const res = await app.request('http://localhost/seconds')
+    expect(res.status).toBe(200)
+
+    const outgoing = JSON.parse(logs[1])
+    expect(outgoing.elapsed).toMatch(/1s/)
+  })
+
+  it('output contains no ANSI color codes', async () => {
+    await app.request('http://localhost/hello')
+    for (const entry of logs) {
+      expect(entry).not.toMatch(/\x1b\[/)
+    }
+  })
+})
+
+describe('Logger by Middleware in JSON mode with default console.log', () => {
+  it('uses console.log by default without throwing', async () => {
+    const app = new Hono()
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    app.use('*', logger(undefined, { mode: 'json' }))
+    app.get('/test', (c) => c.text('ok'))
+
+    const res = await app.request('http://localhost/test')
+    expect(res.status).toBe(200)
+    expect(consoleSpy).toHaveBeenCalledTimes(2)
+
+    const incomingCall = consoleSpy.mock.calls[0][0]
+    const incoming = JSON.parse(incomingCall)
+    expect(incoming.direction).toBe('incoming')
+    expect(incoming.method).toBe('GET')
+
+    const outgoingCall = consoleSpy.mock.calls[1][0]
+    const outgoing = JSON.parse(outgoingCall)
+    expect(outgoing.direction).toBe('outgoing')
+    expect(outgoing.status).toBe(200)
+
+    consoleSpy.mockRestore()
+  })
+})
+
+describe('Logger by Middleware in YAML mode', () => {
+  const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z$/
+  let app: Hono
+  let logs: string[]
+
+  function parseYaml(str: string): Record<string, string> {
+    const result: Record<string, string> = {}
+    for (const line of str.split('\n')) {
+      const idx = line.indexOf(': ')
+      if (idx !== -1) {
+        const key = line.slice(0, idx)
+        let value = line.slice(idx + 2)
+        if (value.startsWith('"') && value.endsWith('"')) {
+          value = value.slice(1, -1)
+        }
+        result[key] = value
+      }
+    }
+    return result
+  }
+
+  beforeEach(() => {
+    function sleep(time: number) {
+      return new Promise((resolve) => setTimeout(resolve, time))
+    }
+
+    app = new Hono()
+    logs = []
+
+    const logFn = (str: string) => {
+      logs.push(str)
+    }
+
+    app.use('*', logger(logFn, { mode: 'yaml' }))
+    app.get('/hello', (c) => c.text('Hello'))
+    app.get('/redirect', (c) => c.redirect('/hello', 301))
+    app.get('/not-found', (c) => c.text('Not Found', 404))
+    app.get('/error', (c) => c.text('Server Error', 500))
+    app.get('/seconds', async (c) => {
+      await sleep(1000)
+      return c.text('slow')
+    })
+  })
+
+  it('emits valid YAML for incoming and outgoing with timestamp', async () => {
+    const res = await app.request('http://localhost/hello')
+    expect(res.status).toBe(200)
+    expect(logs).toHaveLength(2)
+
+    const incoming = parseYaml(logs[0])
+    expect(incoming.timestamp).toMatch(ISO_8601_RE)
+    expect(incoming.direction).toBe('incoming')
+    expect(incoming.method).toBe('GET')
+    expect(incoming.path).toBe('/hello')
+    expect(incoming.level).toBe('info')
+    expect(incoming.status).toBeUndefined()
+    expect(incoming.elapsed).toBeUndefined()
+
+    const outgoing = parseYaml(logs[1])
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+    expect(outgoing.direction).toBe('outgoing')
+    expect(outgoing.method).toBe('GET')
+    expect(outgoing.path).toBe('/hello')
+    expect(outgoing.level).toBe('info')
+    expect(outgoing.status).toBe('200')
+    expect(outgoing.elapsed).toMatch(/m?s$/)
+  })
+
+  it('includes query params in path', async () => {
+    const res = await app.request('http://localhost/hello?foo=bar')
+    expect(res.status).toBe(200)
+
+    const incoming = parseYaml(logs[0])
+    expect(incoming.path).toBe('/hello?foo=bar')
+
+    const outgoing = parseYaml(logs[1])
+    expect(outgoing.path).toBe('/hello?foo=bar')
+  })
+
+  it('records correct status and level for 301 redirect', async () => {
+    const res = await app.request('http://localhost/redirect')
+    expect(res.status).toBe(301)
+
+    const outgoing = parseYaml(logs[1])
+    expect(outgoing.status).toBe('301')
+    expect(outgoing.level).toBe('info')
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+  })
+
+  it('records correct status and warn level for 404', async () => {
+    const res = await app.request('http://localhost/not-found')
+    expect(res.status).toBe(404)
+
+    const outgoing = parseYaml(logs[1])
+    expect(outgoing.status).toBe('404')
+    expect(outgoing.level).toBe('warn')
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+  })
+
+  it('records correct status and error level for 500', async () => {
+    const res = await app.request('http://localhost/error')
+    expect(res.status).toBe(500)
+
+    const outgoing = parseYaml(logs[1])
+    expect(outgoing.status).toBe('500')
+    expect(outgoing.level).toBe('error')
+    expect(outgoing.timestamp).toMatch(ISO_8601_RE)
+  })
+
+  it('elapsed time in seconds for slow responses', async () => {
+    const res = await app.request('http://localhost/seconds')
+    expect(res.status).toBe(200)
+
+    const outgoing = parseYaml(logs[1])
+    expect(outgoing.elapsed).toMatch(/1s/)
+  })
+
+  it('output contains no ANSI color codes', async () => {
+    await app.request('http://localhost/hello')
+    for (const entry of logs) {
+      expect(entry).not.toMatch(/\x1b\[/)
+    }
+  })
+
+  it('each entry is newline-separated key-value pairs', async () => {
+    await app.request('http://localhost/hello')
+    for (const entry of logs) {
+      const lines = entry.split('\n')
+      for (const line of lines) {
+        expect(line).toMatch(/^\w+: .+$/)
+      }
+    }
+  })
+})
+
 describe('Logger by Middleware in NO_COLOR', () => {
   let app: Hono
   let log: string
